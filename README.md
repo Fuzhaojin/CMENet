@@ -22,11 +22,7 @@ CMENet 是一个面向三模态医学影像数据的分割项目。当前项目�
 results/A compare_result/CMENet_NoK_caro_network4_NK_seg/checkpoints/best-epoch1319-loss0.8286.pth
 ```
 
-权重获取：
-
-```
-链接: https://pan.baidu.com/s/1XUfBYM6orgNI4w9kxvIM1g?pwd=9621 提取码: 9621 
-```
+权重获取：https://pan.baidu.com/s/1XUfBYM6orgNI4w9kxvIM1g?pwd=9621 提取码: 9621 
 
 
 
