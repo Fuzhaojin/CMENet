@@ -314,10 +314,12 @@ def _resolve_nifti_path(dir_path, fname_base):
 def _load_nifti(path, modality_name):
     if not os.path.exists(path):
         raise FileNotFoundError(f"{modality_name} 文件不存在: {path}")
-    arr = nib.load(path).get_fdata().astype(np.float32)
+    nii_obj = nib.load(path)
+    arr = nii_obj.get_fdata().astype(np.float32)
+    affine = nii_obj.affine
     if arr.ndim == 4:
         arr = arr.squeeze(-1) if arr.shape[-1] == 1 else arr[..., 0]
-    return arr
+    return arr, affine
 
 
 def _normalize(arr, mean, std):
@@ -329,6 +331,7 @@ def _normalize(arr, mean, std):
 
 
 def preprocess_single(t1_arr, t1c_arr, tof_arr, norm_cfg):
+    original_shape = t1_arr.shape[:2]
     t1_arr = _adjust_to_30_slices(t1_arr, "T1")
     t1c_arr = _adjust_to_30_slices(t1c_arr, "T1C")
     tof_arr = _adjust_to_30_slices(tof_arr, "TOF")
@@ -345,7 +348,7 @@ def preprocess_single(t1_arr, t1c_arr, tof_arr, norm_cfg):
     t1c = TF.resize(t1c, [128, 128])
     tof = TF.resize(tof, [128, 128])
 
-    return t1.unsqueeze(0), t1c.unsqueeze(0), tof.unsqueeze(0)
+    return t1.unsqueeze(0), t1c.unsqueeze(0), tof.unsqueeze(0), original_shape
 
 
 # ── 模型加载 ─────────────────────────────────────────────────────────
@@ -378,12 +381,18 @@ def infer_single(model, t1, t1c, tof, device):
     return mask.astype(np.float32)
 
 
-def save_results(mask, output_dir, name, threshold=0.5):
+def save_results(mask, output_dir, name, affine, original_shape, threshold=0.5):
     os.makedirs(output_dir, exist_ok=True)
     mask_bin = (mask > threshold).astype(np.int16)
 
+    mask_resized = np.zeros((*original_shape, mask_bin.shape[-1]), dtype=np.int16)
+    for i in range(mask_bin.shape[-1]):
+        slice_2d = torch.from_numpy(mask_bin[:, :, i]).unsqueeze(0).unsqueeze(0).float()
+        slice_resized = TF.resize(slice_2d, list(original_shape), interpolation=TF.InterpolationMode.NEAREST)
+        mask_resized[:, :, i] = slice_resized.squeeze().numpy().astype(np.int16)
+
     nii_path = os.path.join(output_dir, f"{name}_pred.nii")
-    nib.save(nib.Nifti1Image(mask_bin, np.eye(4)), nii_path)
+    nib.save(nib.Nifti1Image(mask_resized, affine), nii_path)
 
     png_path = os.path.join(output_dir, f"{name}_pred.png")
     mid = mask_bin.shape[-1] // 2
@@ -416,13 +425,13 @@ def process_dataset(images_dir, names, name_pattern, model, norm_cfg, device,
             t1_path = _resolve_nifti_path(t1_dir, t1_base)
             t1c_path = _resolve_nifti_path(t1c_dir, t1c_base)
             tof_path = _resolve_nifti_path(tof_dir, tof_base)
-            t1_arr = _load_nifti(t1_path, "T1")
-            t1c_arr = _load_nifti(t1c_path, "T1C")
-            tof_arr = _load_nifti(tof_path, "TOF")
+            t1_arr, affine = _load_nifti(t1_path, "T1")
+            t1c_arr, _ = _load_nifti(t1c_path, "T1C")
+            tof_arr, _ = _load_nifti(tof_path, "TOF")
 
-            t1_t, t1c_t, tof_t = preprocess_single(t1_arr, t1c_arr, tof_arr, norm_cfg)
+            t1_t, t1c_t, tof_t, original_shape = preprocess_single(t1_arr, t1c_arr, tof_arr, norm_cfg)
             mask = infer_single(model, t1_t, t1c_t, tof_t, device)
-            save_results(mask, output_dir, name, threshold)
+            save_results(mask, output_dir, name, affine, original_shape, threshold)
         except Exception as e:
             print(f"\n[ERROR] 样本 '{name}' 处理失败: {e}")
             failed.append(name)

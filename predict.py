@@ -105,14 +105,15 @@ def _adjust_to_30_slices(arr, modality_name):
 
 
 def _load_nifti(path, modality_name):
-    """加载 nii 文件并转换为 float32 numpy (H, W, C)。"""
+    """加载 nii 文件并转换为 float32 numpy (H, W, C)，同时返回仿射矩阵。"""
     if not os.path.exists(path):
         raise FileNotFoundError(f"{modality_name} 文件不存在: {path}")
-    arr = nib.load(path).get_fdata().astype(np.float32)
+    nii_obj = nib.load(path)
+    arr = nii_obj.get_fdata().astype(np.float32)
+    affine = nii_obj.affine
     if arr.ndim == 4:
-        # 某些 nii 会附带第 4 维 (通常是 1)，将其压缩
         arr = arr.squeeze(-1) if arr.shape[-1] == 1 else arr[..., 0]
-    return arr
+    return arr, affine
 
 
 def _normalize(arr, mean, std):
@@ -129,28 +130,24 @@ def preprocess_single(t1_arr, t1c_arr, tof_arr, norm_cfg):
     对三个模态的 numpy 数组 (H, W, C) 做预处理，
     返回 tensor tuple: (t1, t1c, tof)，形状均为 (1, 30, 128, 128)。
     """
-    # 1. 通道裁剪/补齐
+    original_shape = t1_arr.shape[:2]
     t1_arr = _adjust_to_30_slices(t1_arr, "T1")
     t1c_arr = _adjust_to_30_slices(t1c_arr, "T1C")
     tof_arr = _adjust_to_30_slices(tof_arr, "TOF")
 
-    # 2. 归一化 (z-score → min-max [0, 255])
     t1_arr = _normalize(t1_arr, norm_cfg["t1_mean"], norm_cfg["t1_std"])
     t1c_arr = _normalize(t1c_arr, norm_cfg["t1c_mean"], norm_cfg["t1c_std"])
     tof_arr = _normalize(tof_arr, norm_cfg["tof_mean"], norm_cfg["tof_std"])
 
-    # 3. 转为 Tensor，调整维度: (H, W, C) → (C, H, W)
     t1 = torch.from_numpy(t1_arr).permute(2, 0, 1).contiguous()
     t1c = torch.from_numpy(t1c_arr).permute(2, 0, 1).contiguous()
     tof = torch.from_numpy(tof_arr).permute(2, 0, 1).contiguous()
 
-    # 4. Resize 到 128x128
     t1 = TF.resize(t1, [128, 128])
     t1c = TF.resize(t1c, [128, 128])
     tof = TF.resize(tof, [128, 128])
 
-    # 5. 添加 batch 维度
-    return t1.unsqueeze(0), t1c.unsqueeze(0), tof.unsqueeze(0)
+    return t1.unsqueeze(0), t1c.unsqueeze(0), tof.unsqueeze(0), original_shape
 
 
 # ── 模型加载 ─────────────────────────────────────────────────────────
@@ -188,20 +185,23 @@ def infer_single(model, t1, t1c, tof, device):
     return mask.astype(np.float32)
 
 
-def save_results(mask, output_dir, base_name, threshold=0.5):
+def save_results(mask, output_dir, base_name, affine, original_shape, threshold=0.5):
     """保存预测结果: .nii 文件 + 中间切片 PNG。"""
     os.makedirs(output_dir, exist_ok=True)
 
-    # 二值化
     mask_bin = (mask > threshold).astype(np.int16)
 
-    # NIfTI
+    mask_resized = np.zeros((*original_shape, mask_bin.shape[-1]), dtype=np.int16)
+    for i in range(mask_bin.shape[-1]):
+        slice_2d = torch.from_numpy(mask_bin[:, :, i]).unsqueeze(0).unsqueeze(0).float()
+        slice_resized = TF.resize(slice_2d, list(original_shape), interpolation=TF.InterpolationMode.NEAREST)
+        mask_resized[:, :, i] = slice_resized.squeeze().numpy().astype(np.int16)
+
     nii_path = os.path.join(output_dir, f"{base_name}_pred.nii")
-    nii_img = nib.Nifti1Image(mask_bin, np.eye(4))
+    nii_img = nib.Nifti1Image(mask_resized, affine)
     nib.save(nii_img, nii_path)
     print(f"[INFO] 分割结果已保存至: {nii_path}")
 
-    # PNG 预览 (中间切片)
     png_path = os.path.join(output_dir, f"{base_name}_pred.png")
     mid = mask_bin.shape[-1] // 2
     fig, ax = plt.subplots(figsize=(256 / 72, 256 / 72))
@@ -243,37 +243,29 @@ def main():
 
     args = parser.parse_args()
 
-    # ── 设备 ──
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    # ── 归一化配置 ──
     norm_cfg = NORM_STATS[args.norm_dataset][args.norm_split]
 
-    # ── 加载数据 ──
-    t1_arr = _load_nifti(args.t1, "T1")
-    t1c_arr = _load_nifti(args.t1c, "T1C")
-    tof_arr = _load_nifti(args.tof, "TOF")
+    t1_arr, affine = _load_nifti(args.t1, "T1")
+    t1c_arr, _ = _load_nifti(args.t1c, "T1C")
+    tof_arr, _ = _load_nifti(args.tof, "TOF")
 
     base_name = args.name or os.path.splitext(os.path.basename(args.t1))[0]
-    # 去掉常见的后缀标签
     for suffix in ["_image", "_T1", "T1"]:
         if base_name.endswith(suffix):
             base_name = base_name[:-len(suffix)]
             break
 
-    # ── 预处理 ──
-    t1_t, t1c_t, tof_t = preprocess_single(t1_arr, t1c_arr, tof_arr, norm_cfg)
+    t1_t, t1c_t, tof_t, original_shape = preprocess_single(t1_arr, t1c_arr, tof_arr, norm_cfg)
 
-    # ── 构建模型 ──
     config = setting_config
     model = build_model(config, args.weight, device)
 
-    # ── 推理 ──
     print("[INFO] 正在推理...")
     mask = infer_single(model, t1_t, t1c_t, tof_t, device)
 
-    # ── 保存 ──
-    save_results(mask, args.output, base_name, args.threshold)
+    save_results(mask, args.output, base_name, affine, original_shape, args.threshold)
 
     print("[DONE] 预测完成。")
 
